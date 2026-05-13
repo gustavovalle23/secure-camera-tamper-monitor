@@ -20,7 +20,164 @@ The Arduino Mega sends a heartbeat to the Raspberry Pi over USB serial and displ
 
 The ESP32 sends a heartbeat to the Raspberry Pi over Wi-Fi.
 
-The Raspberry Pi stores secure logs, serves a local dashboard, and triggers alerts.
+The Raspberry Pi stores secure logs, exposes camera/data endpoints, and triggers alerts.
+
+## Raspberry app
+
+The Raspberry-side Flask application now lives in [raspberry/app/main.py](/Users/gustavo/Documents/Github/secure-camera/sensors/raspberry/app/main.py).
+
+Expected structure:
+
+```text
+raspberry/
+├── app/
+│   ├── main.py
+│   ├── camera.py
+│   ├── mega_serial.py
+│   ├── esp32_api.py
+│   ├── database.py
+│   ├── secure_log.py
+│   └── export.py
+├── data/
+│   └── exports/
+└── static/
+    └── snapshots/
+```
+
+Run it on the Pi with:
+
+```bash
+cd sensors/raspberry
+python3 app/main.py
+```
+
+## Deploy from MacBook to Raspberry Pi
+
+This flow assumes:
+
+* your MacBook and Raspberry Pi are on the same local network
+* SSH is enabled on the Raspberry Pi
+* the Pi is reachable as `raspberrypi.local` or by LAN IP
+* you are deploying only the Raspberry service from `sensors/raspberry`
+
+### 1. Prepare the Raspberry Pi once
+
+SSH into the Pi:
+
+```bash
+ssh pi@raspberrypi.local
+```
+
+Install Python and camera dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv libcap-dev libatlas-base-dev libjpeg-dev
+```
+
+Create an app directory on the Pi:
+
+```bash
+mkdir -p ~/secure-camera
+```
+
+### 2. Copy the Raspberry app from your MacBook
+
+From your MacBook, inside the repo root, copy the Raspberry service to the Pi:
+
+```bash
+rsync -avz sensors/raspberry/ pi@raspberrypi.local:~/secure-camera/raspberry/
+```
+
+If `rsync` is not available, you can use `scp`:
+
+```bash
+scp -r sensors/raspberry pi@raspberrypi.local:~/secure-camera/
+```
+
+### 3. Install Python dependencies on the Pi
+
+SSH into the Pi and install the app dependencies:
+
+```bash
+ssh pi@raspberrypi.local
+cd ~/secure-camera/raspberry
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+### 4. Start the Flask service on the Pi
+
+From the Pi:
+
+```bash
+cd ~/secure-camera/raspberry
+source .venv/bin/activate
+python3 app/main.py
+```
+
+The service listens on `0.0.0.0:5000`, so devices on the same network can reach it.
+
+### 5. Test from your MacBook
+
+Open these URLs from your MacBook:
+
+* [http://raspberrypi.local:5000/](http://raspberrypi.local:5000/)
+* [http://raspberrypi.local:5000/api/status](http://raspberrypi.local:5000/api/status)
+* [http://raspberrypi.local:5000/video_feed](http://raspberrypi.local:5000/video_feed)
+
+If mDNS is not working, replace `raspberrypi.local` with the Pi LAN IP, for example `http://192.168.1.50:5000/video_feed`.
+
+### 6. Update after code changes
+
+When you change the code on your MacBook, redeploy with:
+
+```bash
+rsync -avz sensors/raspberry/ pi@raspberrypi.local:~/secure-camera/raspberry/
+```
+
+Then restart the app on the Pi:
+
+```bash
+ssh pi@raspberrypi.local
+cd ~/secure-camera/raspberry
+source .venv/bin/activate
+python3 app/main.py
+```
+
+### 7. Optional: run it in the background
+
+For a simple background run without creating a service yet:
+
+```bash
+cd ~/secure-camera/raspberry
+source .venv/bin/activate
+nohup python3 app/main.py > raspberry.log 2>&1 &
+```
+
+You can inspect the log with:
+
+```bash
+tail -f ~/secure-camera/raspberry/raspberry.log
+```
+
+The Raspberry app is API-only. Your separate dashboard machine should consume the JSON endpoints and can embed the MJPEG stream from [http://raspberrypi.local:5000/video_feed](http://raspberrypi.local:5000/video_feed) with:
+
+```html
+<img src="http://raspberrypi.local:5000/video_feed" alt="Realtime camera feed">
+```
+
+Useful endpoints:
+
+* `GET /video_feed`
+* `GET /api/status`
+* `GET /api/events`
+* `POST /api/esp32/heartbeat`
+* `POST /api/mega/heartbeat`
+* `POST /api/camera/snapshot`
+* `GET /api/export/events`
 
 ---
 
@@ -1212,4 +1369,3 @@ This project teaches real defensive-tech concepts:
 * System reliability
 * Threat modeling
 * Test documentation
-
