@@ -163,6 +163,8 @@ class SecureEventLog:
 
         if event.get("snapshot"):
             entry["snapshot"] = event["snapshot"]
+        if event.get("meta") is not None:
+            entry["meta"] = event["meta"]
 
         entry["hash"] = self._calculate_hash(entry)
         return entry
@@ -190,6 +192,8 @@ class SecureEventLog:
             }
             if entry.get("snapshot"):
                 normalized["snapshot"] = entry["snapshot"]
+            if entry.get("meta") is not None:
+                normalized["meta"] = entry["meta"]
             normalized["valid"] = (
                 expected_previous == previous_hash
                 and current_hash == self._calculate_hash(entry)
@@ -247,6 +251,8 @@ class SecureEventLog:
             }
             if entry.get("snapshot"):
                 reconstructed["snapshot"] = entry.get("snapshot")
+            if entry.get("meta") is not None:
+                reconstructed["meta"] = entry.get("meta")
         else:
             reconstructed = {
                 "created_at": entry.get("created_at"),

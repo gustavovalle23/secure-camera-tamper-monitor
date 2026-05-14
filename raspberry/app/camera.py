@@ -6,9 +6,14 @@ from datetime import datetime
 import cv2
 
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+FRAME_WIDTH = int(os.getenv("CAMERA_FRAME_WIDTH", "1280"))
+FRAME_HEIGHT = int(os.getenv("CAMERA_FRAME_HEIGHT", "720"))
 CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+JPEG_QUALITY = int(os.getenv("CAMERA_JPEG_QUALITY", "95"))
+MIN_ZOOM = 1.0
+MAX_ZOOM = 4.0
+MIN_FOCUS = 0.0
+MAX_FOCUS = 1.0
 
 
 class CameraService:
@@ -108,13 +113,72 @@ class CameraService:
             }
 
     def encode_frame(self, frame):
-        ok, encoded = cv2.imencode(".jpg", frame)
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
         if not ok:
             return None
 
         return encoded.tobytes()
 
-    def mjpeg_stream(self):
+    def _normalize_zoom(self, zoom):
+        try:
+            zoom_value = float(zoom)
+        except (TypeError, ValueError):
+            return MIN_ZOOM
+
+        if zoom_value < MIN_ZOOM:
+            return MIN_ZOOM
+        if zoom_value > MAX_ZOOM:
+            return MAX_ZOOM
+        return zoom_value
+
+    def _apply_zoom(self, frame, zoom):
+        zoom_value = self._normalize_zoom(zoom)
+        if zoom_value <= MIN_ZOOM:
+            return frame
+
+        height, width = frame.shape[:2]
+        crop_width = max(1, int(round(width / zoom_value)))
+        crop_height = max(1, int(round(height / zoom_value)))
+        x_start = max(0, (width - crop_width) // 2)
+        y_start = max(0, (height - crop_height) // 2)
+        cropped = frame[y_start:y_start + crop_height, x_start:x_start + crop_width]
+        return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+    def _normalize_focus(self, value):
+        try:
+            focus_value = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+
+        if focus_value < MIN_FOCUS:
+            return MIN_FOCUS
+        if focus_value > MAX_FOCUS:
+            return MAX_FOCUS
+        return focus_value
+
+    def _apply_viewport(self, frame, zoom, focus_x=0.5, focus_y=0.5):
+        zoom_value = self._normalize_zoom(zoom)
+        if zoom_value <= MIN_ZOOM:
+            return frame
+
+        focus_x_value = self._normalize_focus(focus_x)
+        focus_y_value = self._normalize_focus(focus_y)
+        height, width = frame.shape[:2]
+        crop_width = max(1, int(round(width / zoom_value)))
+        crop_height = max(1, int(round(height / zoom_value)))
+        max_x_start = max(0, width - crop_width)
+        max_y_start = max(0, height - crop_height)
+        center_x = int(round(focus_x_value * width))
+        center_y = int(round(focus_y_value * height))
+        x_start = min(max(0, center_x - crop_width // 2), max_x_start)
+        y_start = min(max(0, center_y - crop_height // 2), max_y_start)
+        cropped = frame[y_start:y_start + crop_height, x_start:x_start + crop_width]
+        return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+    def mjpeg_stream(self, zoom=1.0, focus_x=0.5, focus_y=0.5):
+        zoom_value = self._normalize_zoom(zoom)
+        focus_x_value = self._normalize_focus(focus_x)
+        focus_y_value = self._normalize_focus(focus_y)
         while True:
             ok, frame = self.read_frame()
 
@@ -122,7 +186,14 @@ class CameraService:
                 time.sleep(0.2)
                 continue
 
-            payload = self.encode_frame(frame)
+            payload = self.encode_frame(
+                self._apply_viewport(
+                    frame,
+                    zoom_value,
+                    focus_x=focus_x_value,
+                    focus_y=focus_y_value,
+                )
+            )
             if payload is None:
                 continue
 
