@@ -24,7 +24,7 @@ The Raspberry Pi stores secure logs, exposes camera/data endpoints, and triggers
 
 ## Raspberry app
 
-The Raspberry-side Flask application now lives in [raspberry/app/main.py](/Users/gustavo/Documents/Github/secure-camera/sensors/raspberry/app/main.py).
+The Raspberry-side HTTP application now lives in [raspberry/app/main.py](/Users/gustavo/Documents/Github/secure-camera/sensors/raspberry/app/main.py).
 
 Expected structure:
 
@@ -57,7 +57,7 @@ This flow assumes:
 
 * your MacBook and Raspberry Pi are on the same local network
 * SSH is enabled on the Raspberry Pi
-* the Pi is reachable as `raspberrypi.local` or by LAN IP
+* the Pi is reachable as `pi.local` or by LAN IP
 * you are deploying only the Raspberry service from `sensors/raspberry`
 
 ### 1. Prepare the Raspberry Pi once
@@ -65,14 +65,14 @@ This flow assumes:
 SSH into the Pi:
 
 ```bash
-ssh pi@raspberrypi.local
+ssh pi@pi.local
 ```
 
 Install Python and camera dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv libcap-dev libatlas-base-dev libjpeg-dev
+sudo apt install -y python3 python3-pip python3-venv libcap-dev libopenblas-dev libjpeg-dev
 ```
 
 Create an app directory on the Pi:
@@ -86,13 +86,13 @@ mkdir -p ~/secure-camera
 From your MacBook, inside the repo root, copy the Raspberry service to the Pi:
 
 ```bash
-rsync -avz sensors/raspberry/ pi@raspberrypi.local:~/secure-camera/raspberry/
+rsync -avz sensors/raspberry/ pi@pi.local:~/secure-camera/raspberry/
 ```
 
 If `rsync` is not available, you can use `scp`:
 
 ```bash
-scp -r sensors/raspberry pi@raspberrypi.local:~/secure-camera/
+scp -r sensors/raspberry pi@pi.local:~/secure-camera/
 ```
 
 ### 3. Install Python dependencies on the Pi
@@ -100,7 +100,7 @@ scp -r sensors/raspberry pi@raspberrypi.local:~/secure-camera/
 SSH into the Pi and install the app dependencies:
 
 ```bash
-ssh pi@raspberrypi.local
+ssh pi@pi.local
 cd ~/secure-camera/raspberry
 python3 -m venv .venv
 source .venv/bin/activate
@@ -108,7 +108,7 @@ python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 ```
 
-### 4. Start the Flask service on the Pi
+### 4. Start the Raspberry service on the Pi
 
 From the Pi:
 
@@ -124,24 +124,24 @@ The service listens on `0.0.0.0:5000`, so devices on the same network can reach 
 
 Open these URLs from your MacBook:
 
-* [http://raspberrypi.local:5000/](http://raspberrypi.local:5000/)
-* [http://raspberrypi.local:5000/api/status](http://raspberrypi.local:5000/api/status)
-* [http://raspberrypi.local:5000/video_feed](http://raspberrypi.local:5000/video_feed)
+* [http://pi.local:5000/](http://pi.local:5000/)
+* [http://pi.local:5000/api/status](http://pi.local:5000/api/status)
+* [http://pi.local:5000/video_feed](http://pi.local:5000/video_feed)
 
-If mDNS is not working, replace `raspberrypi.local` with the Pi LAN IP, for example `http://192.168.1.50:5000/video_feed`.
+If mDNS is not working, replace `pi.local` with the Pi LAN IP, for example `http://192.168.1.50:5000/video_feed`.
 
 ### 6. Update after code changes
 
 When you change the code on your MacBook, redeploy with:
 
 ```bash
-rsync -avz sensors/raspberry/ pi@raspberrypi.local:~/secure-camera/raspberry/
+rsync -avz sensors/raspberry/ pi@pi.local:~/secure-camera/raspberry/
 ```
 
 Then restart the app on the Pi:
 
 ```bash
-ssh pi@raspberrypi.local
+ssh pi@pi.local
 cd ~/secure-camera/raspberry
 source .venv/bin/activate
 python3 app/main.py
@@ -163,10 +163,10 @@ You can inspect the log with:
 tail -f ~/secure-camera/raspberry/raspberry.log
 ```
 
-The Raspberry app is API-only. Your separate dashboard machine should consume the JSON endpoints and can embed the MJPEG stream from [http://raspberrypi.local:5000/video_feed](http://raspberrypi.local:5000/video_feed) with:
+The Raspberry app is API-only and uses Python's built-in HTTP server instead of Flask. Your separate dashboard machine should consume the JSON endpoints and can embed the MJPEG stream from [http://pi.local:5000/video_feed](http://pi.local:5000/video_feed) with:
 
 ```html
-<img src="http://raspberrypi.local:5000/video_feed" alt="Realtime camera feed">
+<img src="http://pi.local:5000/video_feed" alt="Realtime camera feed">
 ```
 
 Useful endpoints:

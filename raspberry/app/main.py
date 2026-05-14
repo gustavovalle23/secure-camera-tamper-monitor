@@ -1,8 +1,10 @@
+import json
 import os
 import signal
 import sys
-
-from flask import Flask, Response, jsonify, request, send_file
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from camera import CameraService
 from database import Database
@@ -12,6 +14,8 @@ from mega_serial import normalize_mega_payload
 from secure_log import SecureEventLog
 
 
+HOST = os.getenv("RASPBERRY_HOST", "0.0.0.0")
+PORT = int(os.getenv("RASPBERRY_PORT", "5000"))
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 EXPORT_DIR = os.path.join(DATA_DIR, "exports")
@@ -25,11 +29,11 @@ for path in (DATA_DIR, EXPORT_DIR, SNAPSHOT_DIR):
     os.makedirs(path, exist_ok=True)
 
 
-app = Flask(__name__, static_folder=STATIC_DIR)
 database = Database(DATABASE_PATH)
 database.init()
 secure_log = SecureEventLog(SECURE_LOG_PATH)
 camera = CameraService(SNAPSHOT_DIR)
+httpd = None
 
 
 def record_event(event_type: str, source: str, payload: dict):
@@ -38,94 +42,190 @@ def record_event(event_type: str, source: str, payload: dict):
     return {"event_id": event_id, "secure_hash": secure_entry["hash"]}
 
 
-@app.get("/")
-def index():
-    return jsonify(
-        {
-            "service": "secure-camera-raspberry",
-            "role": "api-and-camera-stream",
-            "video_feed_url": "/video_feed",
-            "status_url": "/api/status",
-            "events_url": "/api/events",
-        }
-    )
+class RequestHandler(BaseHTTPRequestHandler):
+    server_version = "SecureCameraHTTP/1.0"
+
+    def do_OPTIONS(self):
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            self._write_json(
+                HTTPStatus.OK,
+                {
+                    "service": "secure-camera-raspberry",
+                    "role": "api-and-camera-stream",
+                    "video_feed_url": "/video_feed",
+                    "status_url": "/api/status",
+                    "events_url": "/api/events",
+                },
+            )
+            return
+
+        if parsed.path == "/video_feed":
+            self._stream_mjpeg()
+            return
+
+        if parsed.path == "/api/status":
+            self._write_json(
+                HTTPStatus.OK,
+                {
+                    "devices": database.fetch_device_status(),
+                    "recent_events": database.fetch_recent_events(limit=20),
+                },
+            )
+            return
+
+        if parsed.path == "/api/events":
+            query = parse_qs(parsed.query)
+            limit = self._parse_limit(query.get("limit", ["50"])[0])
+            self._write_json(HTTPStatus.OK, database.fetch_recent_events(limit=limit))
+            return
+
+        if parsed.path == "/api/export/events":
+            events_payload = database.fetch_recent_events(limit=200)
+            path = export_events(events_payload, EXPORT_DIR)
+            self._send_file(path, "application/json", os.path.basename(path))
+            return
+
+        self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        try:
+            if parsed.path == "/api/esp32/heartbeat":
+                payload = normalize_esp32_payload(self._read_json_body())
+                device = payload["device"]
+                database.upsert_device_status(
+                    device=device,
+                    status="online",
+                    uptime_ms=payload.get("uptime_ms"),
+                    boot_count=payload.get("boot_count"),
+                    meta=payload,
+                )
+                metadata = record_event("heartbeat", device, payload)
+                self._write_json(HTTPStatus.OK, {"ok": True, "device": device, **metadata})
+                return
+
+            if parsed.path == "/api/mega/heartbeat":
+                payload = normalize_mega_payload(self._read_json_body())
+                device = payload["device"]
+                database.upsert_device_status(
+                    device=device,
+                    status="online",
+                    uptime_ms=payload.get("uptime_ms"),
+                    boot_count=payload.get("boot_count"),
+                    meta=payload,
+                )
+                metadata = record_event("heartbeat", device, payload)
+                self._write_json(HTTPStatus.OK, {"ok": True, "device": device, **metadata})
+                return
+        except ValueError:
+            return
+
+        if parsed.path == "/api/camera/snapshot":
+            ok, frame = camera.read_frame()
+            if not ok or frame is None:
+                self._write_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": "camera_unavailable"},
+                )
+                return
+
+            snapshot_path = camera.save_snapshot(frame)
+            payload = {"snapshot_path": snapshot_path}
+            metadata = record_event("snapshot_saved", "camera", payload)
+            self._write_json(HTTPStatus.OK, {"ok": True, **payload, **metadata})
+            return
+
+        self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+
+    def _parse_limit(self, value: str) -> int:
+        try:
+            limit = int(value)
+        except ValueError:
+            return 50
+
+        return max(1, min(limit, 500))
+
+    def _read_json_body(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
+            raise ValueError("invalid_json")
+
+        if not isinstance(payload, dict):
+            self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "json_object_required"})
+            raise ValueError("json_object_required")
+
+        return payload
+
+    def _send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-store")
+
+    def _write_json(self, status: HTTPStatus, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_file(self, path: str, content_type: str, download_name: str):
+        with open(path, "rb") as handle:
+            body = handle.read()
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream_mjpeg(self):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self._send_cors_headers()
+        self.end_headers()
+
+        try:
+            for chunk in camera.mjpeg_stream():
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def log_message(self, format, *args):
+        del format, args
 
 
-@app.get("/video_feed")
-def video_feed():
-    return Response(
-        camera.mjpeg_stream(),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-@app.get("/api/status")
-def status():
-    return jsonify(
-        {
-            "devices": database.fetch_device_status(),
-            "recent_events": database.fetch_recent_events(limit=20),
-        }
-    )
-
-
-@app.get("/api/events")
-def events():
-    limit = int(request.args.get("limit", "50"))
-    return jsonify(database.fetch_recent_events(limit=limit))
-
-
-@app.post("/api/esp32/heartbeat")
-def esp32_heartbeat():
-    payload = normalize_esp32_payload(request.get_json(force=True, silent=False) or {})
-    device = payload["device"]
-    database.upsert_device_status(
-        device=device,
-        status="online",
-        uptime_ms=payload.get("uptime_ms"),
-        boot_count=payload.get("boot_count"),
-        meta=payload,
-    )
-    metadata = record_event("heartbeat", device, payload)
-    return jsonify({"ok": True, "device": device, **metadata})
-
-
-@app.post("/api/mega/heartbeat")
-def mega_heartbeat():
-    payload = normalize_mega_payload(request.get_json(force=True, silent=False) or {})
-    device = payload["device"]
-    database.upsert_device_status(
-        device=device,
-        status="online",
-        uptime_ms=payload.get("uptime_ms"),
-        boot_count=payload.get("boot_count"),
-        meta=payload,
-    )
-    metadata = record_event("heartbeat", device, payload)
-    return jsonify({"ok": True, "device": device, **metadata})
-
-
-@app.post("/api/camera/snapshot")
-def camera_snapshot():
-    ok, frame = camera.read_frame()
-    if not ok or frame is None:
-        return jsonify({"ok": False, "error": "camera_unavailable"}), 503
-
-    snapshot_path = camera.save_snapshot(frame)
-    payload = {"snapshot_path": snapshot_path}
-    metadata = record_event("snapshot_saved", "camera", payload)
-    return jsonify({"ok": True, **payload, **metadata})
-
-
-@app.get("/api/export/events")
-def export_recent_events():
-    events_payload = database.fetch_recent_events(limit=200)
-    path = export_events(events_payload, EXPORT_DIR)
-    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+class SecureCameraServer(ThreadingHTTPServer):
+    daemon_threads = True
 
 
 def shutdown_handler(signum, frame):
     del signum, frame
+
+    if httpd is not None:
+        httpd.shutdown()
+
     camera.stop()
     sys.exit(0)
 
@@ -135,4 +235,9 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    httpd = SecureCameraServer((HOST, PORT), RequestHandler)
+    print(f"[HTTP] secure camera server listening on http://{HOST}:{PORT}")
+    try:
+        httpd.serve_forever()
+    finally:
+        camera.stop()
