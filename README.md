@@ -194,6 +194,7 @@ Useful endpoints:
 * `GET /video_feed`
 * `GET /api/health`
 * `GET /api/health/camera`
+* `GET /api/health/logs`
 * `GET /api/status`
 * `GET /api/events`
 * `POST /api/esp32/heartbeat`

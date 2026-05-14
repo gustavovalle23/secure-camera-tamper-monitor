@@ -131,9 +131,12 @@ class CameraService:
                 b"Content-Type: image/jpeg\r\n\r\n" + payload + b"\r\n"
             )
 
-    def save_snapshot(self, frame):
+    def save_snapshot(self, frame, prefix="snapshot"):
         os.makedirs(self.snapshot_dir, exist_ok=True)
-        filename = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        safe_prefix = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in prefix).strip("_")
+        if not safe_prefix:
+            safe_prefix = "snapshot"
+        filename = f"{safe_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         path = os.path.join(self.snapshot_dir, filename)
         cv2.imwrite(path, frame)
         return path

@@ -1,6 +1,8 @@
 import json
+import mimetypes
 import os
 import platform
+import posixpath
 import signal
 import shutil
 import socket
@@ -98,10 +100,116 @@ class CpuUsageSampler:
 cpu_sampler = CpuUsageSampler()
 
 
-def record_event(event_type: str, source: str, payload: dict):
-    event_id = database.insert_event(event_type=event_type, source=source, payload=payload)
-    secure_entry = secure_log.append(event_type=event_type, source=source, payload=payload)
-    return {"event_id": event_id, "secure_hash": secure_entry["hash"]}
+def record_event(
+    event_type: str,
+    device: str,
+    severity: str,
+    message: str,
+    snapshot=None,
+    acknowledged=False,
+):
+    event = {
+        "type": event_type,
+        "severity": severity,
+        "device": device,
+        "message": message,
+        "acknowledged": acknowledged,
+    }
+    if snapshot:
+        event["snapshot"] = snapshot
+
+    secure_entry = secure_log.append(event)
+    database.insert_event(
+        event_type=secure_entry["type"],
+        source=secure_entry["device"],
+        payload=secure_entry,
+    )
+    return {"event_id": secure_entry["id"], "secure_hash": secure_entry["hash"]}
+
+
+def build_mega_heartbeat_message(payload: dict):
+    counter = payload.get("counter")
+    return f"counter={counter}" if counter is not None else "heartbeat received"
+
+
+def build_esp32_heartbeat_message(payload: dict):
+    parts = []
+    if payload.get("counter") is not None:
+        parts.append(f"counter={payload['counter']}")
+    if payload.get("rssi") is not None:
+        parts.append(f"rssi={payload['rssi']}")
+
+    return " ".join(parts) if parts else "heartbeat received"
+
+
+def normalize_event_limit(raw_value):
+    if raw_value is None or raw_value == "":
+        return None
+
+    if raw_value.lower() == "all":
+        return None
+
+    try:
+        limit = int(raw_value)
+    except ValueError:
+        return 50
+
+    return max(1, min(limit, 5000))
+
+
+def get_recent_events(limit=None):
+    return secure_log.read_events(limit=limit)
+
+
+def get_recent_snapshots(limit=None):
+    return secure_log.read_snapshots(limit=limit)
+
+
+def summarize_snapshot_path(snapshot_path: str):
+    return posixpath.basename(snapshot_path)
+
+
+def build_snapshot_public_path(snapshot_name: str):
+    return f"/static/snapshots/{snapshot_name}"
+
+
+def resolve_snapshot_file(snapshot_name: str):
+    safe_name = os.path.basename(snapshot_name)
+    if safe_name != snapshot_name or safe_name in {"", ".", ".."}:
+        return None
+
+    path = os.path.join(SNAPSHOT_DIR, safe_name)
+    if not os.path.isfile(path):
+        return None
+
+    return path
+
+
+def normalize_snapshot_event(payload: dict):
+    event_type = str(payload.get("type") or "snapshot_saved")
+    severity = str(payload.get("severity") or "info")
+    message = payload.get("message")
+    motion_area = payload.get("motion_area")
+
+    if message is None and motion_area is not None:
+        message = f"Motion area={motion_area}"
+    if message is None:
+        message = event_type.replace("_", " ")
+
+    if event_type == "motion_detected":
+        prefix = "motion"
+    elif event_type.startswith("camera_tamper"):
+        prefix = "tamper"
+    else:
+        prefix = "snapshot"
+
+    return {
+        "type": event_type,
+        "severity": severity,
+        "message": str(message),
+        "motion_area": motion_area,
+        "prefix": prefix,
+    }
 
 
 def get_primary_ip():
@@ -217,6 +325,12 @@ def get_camera_health_payload():
     return payload
 
 
+def get_log_health_payload():
+    payload = secure_log.get_health()
+    payload["captured_at_ms"] = int(time.time() * 1000)
+    return payload
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "SecureCameraHTTP/1.0"
 
@@ -245,12 +359,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._stream_mjpeg()
             return
 
+        if parsed.path.startswith("/static/snapshots/"):
+            snapshot_name = parsed.path.removeprefix("/static/snapshots/")
+            snapshot_path = resolve_snapshot_file(snapshot_name)
+            if snapshot_path is None:
+                self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "snapshot_not_found"})
+                return
+
+            content_type, _ = mimetypes.guess_type(snapshot_path)
+            self._send_file(
+                snapshot_path,
+                content_type or "application/octet-stream",
+                os.path.basename(snapshot_path),
+                as_attachment=False,
+            )
+            return
+
         if parsed.path == "/api/status":
             self._write_json(
                 HTTPStatus.OK,
                 {
                     "devices": database.fetch_device_status(),
-                    "recent_events": database.fetch_recent_events(limit=20),
+                    "recent_events": get_recent_events(limit=20),
                 },
             )
             return
@@ -263,14 +393,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, get_camera_health_payload())
             return
 
+        if parsed.path == "/api/health/logs":
+            self._write_json(HTTPStatus.OK, get_log_health_payload())
+            return
+
         if parsed.path == "/api/events":
             query = parse_qs(parsed.query)
-            limit = self._parse_limit(query.get("limit", ["50"])[0])
-            self._write_json(HTTPStatus.OK, database.fetch_recent_events(limit=limit))
+            limit = normalize_event_limit(query.get("limit", [None])[0])
+            self._write_json(HTTPStatus.OK, get_recent_events(limit=limit))
+            return
+
+        if parsed.path == "/api/snapshots":
+            query = parse_qs(parsed.query)
+            limit = normalize_event_limit(query.get("limit", [None])[0])
+            self._write_json(HTTPStatus.OK, get_recent_snapshots(limit=limit))
             return
 
         if parsed.path == "/api/export/events":
-            events_payload = database.fetch_recent_events(limit=200)
+            events_payload = get_recent_events(limit=200)
             path = export_events(events_payload, EXPORT_DIR)
             self._send_file(path, "application/json", os.path.basename(path))
             return
@@ -291,7 +431,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                     boot_count=payload.get("boot_count"),
                     meta=payload,
                 )
-                metadata = record_event("heartbeat", device, payload)
+                metadata = record_event(
+                    event_type="esp32_heartbeat",
+                    device=device,
+                    severity="debug",
+                    message=build_esp32_heartbeat_message(payload),
+                )
                 self._write_json(HTTPStatus.OK, {"ok": True, "device": device, **metadata})
                 return
 
@@ -305,13 +450,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                     boot_count=payload.get("boot_count"),
                     meta=payload,
                 )
-                metadata = record_event("heartbeat", device, payload)
+                metadata = record_event(
+                    event_type="mega_heartbeat",
+                    device=device,
+                    severity="debug",
+                    message=build_mega_heartbeat_message(payload),
+                )
                 self._write_json(HTTPStatus.OK, {"ok": True, "device": device, **metadata})
                 return
         except ValueError:
             return
 
         if parsed.path == "/api/camera/snapshot":
+            payload = self._read_json_body()
             ok, frame = camera.read_frame()
             if not ok or frame is None:
                 self._write_json(
@@ -320,21 +471,32 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            snapshot_path = camera.save_snapshot(frame)
-            payload = {"snapshot_path": snapshot_path}
-            metadata = record_event("snapshot_saved", "camera", payload)
-            self._write_json(HTTPStatus.OK, {"ok": True, **payload, **metadata})
+            snapshot_event = normalize_snapshot_event(payload)
+            snapshot_path = camera.save_snapshot(frame, prefix=snapshot_event["prefix"])
+            snapshot_name = summarize_snapshot_path(snapshot_path)
+            metadata = record_event(
+                event_type=snapshot_event["type"],
+                device="camera",
+                severity=snapshot_event["severity"],
+                message=snapshot_event["message"],
+                snapshot=snapshot_name,
+            )
+            self._write_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "snapshot_path": snapshot_path,
+                    "snapshot": snapshot_name,
+                    "snapshot_url": build_snapshot_public_path(snapshot_name),
+                    "type": snapshot_event["type"],
+                    "message": snapshot_event["message"],
+                    "motion_area": snapshot_event["motion_area"],
+                    **metadata,
+                },
+            )
             return
 
         self._write_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
-
-    def _parse_limit(self, value: str) -> int:
-        try:
-            limit = int(value)
-        except ValueError:
-            return 50
-
-        return max(1, min(limit, 500))
 
     def _read_json_body(self):
         try:
@@ -370,14 +532,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path: str, content_type: str, download_name: str):
+    def _send_file(self, path: str, content_type: str, download_name: str, as_attachment: bool = True):
         with open(path, "rb") as handle:
             body = handle.read()
 
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        disposition = "attachment" if as_attachment else "inline"
+        self.send_header("Content-Disposition", f'{disposition}; filename="{download_name}"')
         self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
