@@ -97,15 +97,12 @@ scp -r sensors/raspberry pi@pi.local:~/secure-camera/
 
 ### 3. Install Python dependencies on the Pi
 
-SSH into the Pi and install the app dependencies:
+SSH into the Pi and install the app dependencies without a virtualenv:
 
 ```bash
 ssh pi@pi.local
 cd ~/secure-camera/raspberry
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python3 -m pip install --user -r requirements.txt
 ```
 
 ### 4. Start the Raspberry service on the Pi
@@ -114,7 +111,6 @@ From the Pi:
 
 ```bash
 cd ~/secure-camera/raspberry
-source .venv/bin/activate
 python3 app/main.py
 ```
 
@@ -143,7 +139,6 @@ Then restart the app on the Pi:
 ```bash
 ssh pi@pi.local
 cd ~/secure-camera/raspberry
-source .venv/bin/activate
 python3 app/main.py
 ```
 
@@ -153,7 +148,6 @@ For a simple background run without creating a service yet:
 
 ```bash
 cd ~/secure-camera/raspberry
-source .venv/bin/activate
 nohup python3 app/main.py > raspberry.log 2>&1 &
 ```
 
@@ -161,6 +155,32 @@ You can inspect the log with:
 
 ```bash
 tail -f ~/secure-camera/raspberry/raspberry.log
+```
+
+### 8. Deploy with the helper script
+
+There is also a deploy helper script at [raspberry/deploy.sh](/Users/gustavo/Documents/Github/secure-camera/sensors/raspberry/deploy.sh).
+
+Run it from your MacBook:
+
+```bash
+cd sensors/raspberry
+chmod +x deploy.sh
+./deploy.sh
+```
+
+It will:
+
+* `rsync` the Raspberry project to `pi@pi.local:~/secure-camera/raspberry`
+* install `requirements.txt` on the Pi with `python3 -m pip install --user -r requirements.txt`
+* stop the previous `python3 app/main.py` process
+* start the app again in the background and write logs to `~/secure-camera/raspberry/raspberry.log`
+* skip local virtualenv folders like `.venv`, `venv`, and `env` so it does not overwrite a Pi-side environment
+
+Optional overrides:
+
+```bash
+PI_HOST=192.168.1.50 PI_USER=pi ./deploy.sh
 ```
 
 The Raspberry app is API-only and uses Python's built-in HTTP server instead of Flask. Your separate dashboard machine should consume the JSON endpoints and can embed the MJPEG stream from [http://pi.local:5000/video_feed](http://pi.local:5000/video_feed) with:
@@ -172,6 +192,8 @@ The Raspberry app is API-only and uses Python's built-in HTTP server instead of 
 Useful endpoints:
 
 * `GET /video_feed`
+* `GET /api/health`
+* `GET /api/health/camera`
 * `GET /api/status`
 * `GET /api/events`
 * `POST /api/esp32/heartbeat`
